@@ -120,6 +120,13 @@ target_link_libraries(dye_tests PRIVATE dye)
 target_compile_options(dye_tests PRIVATE -Wall -Wextra)
 add_test(NAME format COMMAND dye_tests)
 
+# What a frame costs. Not a correctness test: the worst bug in this library
+# was a 637 ms read-back whose pixels were perfectly correct, so only a
+# number on a clock could find it. Built always, run by hand.
+add_executable(dye_bench tests/bench_readback.cpp)
+target_link_libraries(dye_bench PRIVATE dye)
+target_compile_options(dye_bench PRIVATE -Wall -Wextra -O2)
+
 # The confusions that must not compile. A library selling type safety has to
 # prove the errors actually happen.
 add_test(NAME compile_fail
