@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(jaal)
+find_dependency(weft)
+
+include("${CMAKE_CURRENT_LIST_DIR}/dyeTargets.cmake")
+check_required_components(dye)
