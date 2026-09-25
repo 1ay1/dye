@@ -449,6 +449,74 @@ void a_partial_upload_keeps_the_rest() {
     std::printf("  a damage upload changed %d rows and left %d alone\n", kRows, kH - kRows);
 }
 
+/// A big upload produces the right pixels, all of them.
+///
+/// The upload path does page-alignment and row-offset arithmetic that a
+/// small image never exercises: a 64x32 test fits in one page and one
+/// command, so it cannot catch an image shifted by a few rows. A 1080p
+/// gradient can — a one-row or one-column slip shows up as thousands of
+/// mismatched pixels rather than as nothing at all.
+///
+/// This also guards the fast paths that come and go here. A zero-copy
+/// import (VK_EXT_external_memory_host) was tried and reverted because it
+/// was slower in a real compositor than the staging copy; if it or anything
+/// like it returns, this is the test that says whether it is CORRECT,
+/// separately from whether it is fast.
+void a_big_upload_is_still_correct() {
+    auto device = dye::Device::open();
+    if (!device) {
+        std::printf("  SKIP: %s\n", device.error().what.data());
+        ++skipped;
+        return;
+    }
+
+    // Big enough to span many pages and many rows.
+    constexpr std::int32_t kW = 1920, kH = 1080;
+    auto buf = (*device)->allocate(kW, kH, dye::formats::xrgb8888);
+    if (!buf) {
+        std::printf("  SKIP: allocate refused\n");
+        ++skipped;
+        return;
+    }
+    auto image = (*device)->import(std::move(*buf));
+    if (!image) {
+        std::printf("  SKIP: import refused\n");
+        ++skipped;
+        return;
+    }
+
+    // A gradient, so a shift by even one row or column is visible as a
+    // mismatch rather than hiding in a flat colour.
+    std::vector<std::uint32_t> src(static_cast<std::size_t>(kW) * kH);
+    for (std::int32_t y = 0; y < kH; ++y)
+        for (std::int32_t x = 0; x < kW; ++x)
+            src[static_cast<std::size_t>(y) * kW + x] =
+                0xff000000u | (static_cast<std::uint32_t>(x & 0xff) << 16) |
+                (static_cast<std::uint32_t>(y & 0xff) << 8) |
+                static_cast<std::uint32_t>((x ^ y) & 0xff);
+
+    if (!(*image)->write(src.data(), kW)) {
+        std::printf("  SKIP: write refused\n");
+        ++skipped;
+        return;
+    }
+
+    std::vector<std::uint32_t> back(static_cast<std::size_t>(kW) * kH, 0);
+    if (!(*image)->read(back.data(), kW)) {
+        std::printf("  SKIP: read-back refused\n");
+        ++skipped;
+        return;
+    }
+
+    std::size_t wrong = 0;
+    for (std::size_t i = 0; i < src.size(); ++i)
+        if ((back[i] & 0x00ffffffu) != (src[i] & 0x00ffffffu)) ++wrong;
+
+    CHECK(wrong == 0);
+    std::printf("  a %dx%d gradient survives a full upload (%zu wrong pixels)\n", kW, kH,
+                wrong);
+}
+
 }  // namespace
 
 void run_device_tests() {
@@ -461,6 +529,7 @@ void run_device_tests() {
     malformed_buffers_are_refused_before_the_driver();
     importing_does_not_keep_the_client_s_descriptors();
     a_partial_upload_keeps_the_rest();
+    a_big_upload_is_still_correct();
 
     // Say so loudly. A silent skip is how a suite reports "all passed" on a
     // machine where it tested nothing.
