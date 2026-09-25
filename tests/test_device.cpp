@@ -368,6 +368,87 @@ void importing_does_not_keep_the_client_s_descriptors() {
     std::printf("  descriptors before %zu, after %zu\n", before, after);
 }
 
+/// A damage upload writes the rows it was given and LEAVES THE REST.
+///
+/// This is the whole risk of uploading only what changed. Get the layout
+/// transition wrong (UNDEFINED says "the contents may be discarded") and the
+/// untouched rows come back as garbage — on screen that is a window whose
+/// unchanged parts flicker to noise, which no full-upload test can catch.
+void a_partial_upload_keeps_the_rest() {
+    auto device = dye::Device::open();
+    if (!device) {
+        std::printf("  SKIP: %s\n", device.error().what.data());
+        ++skipped;
+        return;
+    }
+
+    constexpr std::int32_t kW = 64, kH = 32;
+    auto buf = (*device)->allocate(kW, kH, dye::formats::argb8888);
+    if (!buf) {
+        std::printf("  SKIP: allocate refused\n");
+        ++skipped;
+        return;
+    }
+    auto image = (*device)->import(std::move(*buf));
+    if (!image) {
+        std::printf("  SKIP: import refused\n");
+        ++skipped;
+        return;
+    }
+
+    // Fill it all with one colour, then change a band in the middle.
+    constexpr std::uint32_t kOld = 0xff112233, kNew = 0xffddeeff;
+    std::vector<std::uint32_t> all(static_cast<std::size_t>(kW) * kH, kOld);
+    if (!(*image)->write(all.data(), kW)) {
+        std::printf("  SKIP: full write refused\n");
+        ++skipped;
+        return;
+    }
+
+    constexpr std::int32_t kFrom = 8, kRows = 10;
+    std::vector<std::uint32_t> edited = all;
+    for (std::int32_t y = kFrom; y < kFrom + kRows; ++y)
+        for (std::int32_t x = 0; x < kW; ++x)
+            edited[static_cast<std::size_t>(y) * kW + x] = kNew;
+
+    // The source is the WHOLE buffer; only these rows should move.
+    if (!(*image)->write_rows(edited.data(), kW, kFrom, kRows)) {
+        std::printf("  SKIP: partial write refused\n");
+        ++skipped;
+        return;
+    }
+
+    std::vector<std::uint32_t> back(static_cast<std::size_t>(kW) * kH, 0);
+    if (!(*image)->read(back.data(), kW)) {
+        std::printf("  SKIP: read-back refused\n");
+        ++skipped;
+        return;
+    }
+
+    bool band_updated = true, rest_intact = true;
+    for (std::int32_t y = 0; y < kH; ++y) {
+        const bool in_band = y >= kFrom && y < kFrom + kRows;
+        for (std::int32_t x = 0; x < kW; ++x) {
+            const std::uint32_t got = back[static_cast<std::size_t>(y) * kW + x];
+            if (in_band) {
+                if (got != kNew) band_updated = false;
+            } else if (got != kOld) {
+                rest_intact = false;
+            }
+        }
+    }
+
+    CHECK(band_updated);   // the damaged rows did change
+    CHECK(rest_intact);    // and nothing else did
+
+    // Rows outside the image are clamped, not an error: a client may damage a
+    // region of a buffer it has just resized.
+    CHECK((*image)->write_rows(edited.data(), kW, kH + 100, 4).has_value());
+    CHECK((*image)->write_rows(edited.data(), kW, -5, 2).has_value());
+
+    std::printf("  a damage upload changed %d rows and left %d alone\n", kRows, kH - kRows);
+}
+
 }  // namespace
 
 void run_device_tests() {
@@ -379,6 +460,7 @@ void run_device_tests() {
     a_real_buffer_imports_and_reads_back();
     malformed_buffers_are_refused_before_the_driver();
     importing_does_not_keep_the_client_s_descriptors();
+    a_partial_upload_keeps_the_rest();
 
     // Say so loudly. A silent skip is how a suite reports "all passed" on a
     // machine where it tested nothing.

@@ -306,6 +306,8 @@ public:
 
     Status read(std::uint32_t* dst, std::int32_t dst_stride_px) override;
     Status write(const std::uint32_t* src, std::int32_t src_stride_px) override;
+    Status write_rows(const std::uint32_t* src, std::int32_t src_stride_px, std::int32_t y,
+                      std::int32_t height) override;
 
 private:
     /// The staging buffer both directions share: made once, kept mapped,
@@ -896,16 +898,36 @@ Status VulkanImage::ensure_staging(VkDeviceSize bytes) {
 }
 
 Status VulkanImage::write(const std::uint32_t* src, std::int32_t src_stride_px) {
+    return write_rows(src, src_stride_px, 0, size_.height);
+}
+
+Status VulkanImage::write_rows(const std::uint32_t* src, std::int32_t src_stride_px,
+                              std::int32_t first_row, std::int32_t rows) {
     if (!src) return fail(std::errc::invalid_argument, "write() needs something to copy");
     if (size_.empty()) return fail(std::errc::invalid_argument, "the image has no pixels");
     if (src_stride_px < size_.width)
         return fail(std::errc::invalid_argument, "the source stride is too small");
 
+    // Clamp rather than reject: a client's damage may legitimately name rows
+    // outside the buffer it just resized, and the answer to that is to upload
+    // the part that exists, not to fail the frame.
+    if (first_row < 0) {
+        rows += first_row;
+        first_row = 0;
+    }
+    if (first_row >= size_.height || rows <= 0) return Status{};
+    rows = std::min(rows, size_.height - first_row);
+
     VkDevice dev = device_.vk();
     const auto w = static_cast<std::uint32_t>(size_.width);
-    const auto h = static_cast<std::uint32_t>(size_.height);
+    const auto y0 = static_cast<std::uint32_t>(first_row);
+    const auto n = static_cast<std::uint32_t>(rows);
 
-    if (auto s = ensure_staging(static_cast<VkDeviceSize>(w) * h * 4); !s) return s;
+    // The staging buffer is sized for the WHOLE image and kept, so a partial
+    // upload reuses it at the right offset rather than reallocating per
+    // damage rectangle.
+    const auto full_h = static_cast<std::uint32_t>(size_.height);
+    if (auto s = ensure_staging(static_cast<VkDeviceSize>(w) * full_h * 4); !s) return s;
 
     // Premultiplied ARGB32 into the image's own channel order. The same
     // mapping read() undoes, written once in each direction rather than a
@@ -920,21 +942,24 @@ Status VulkanImage::write(const std::uint32_t* src, std::int32_t src_stride_px) 
     // thread: a fullscreen terminal redrawing at 60 Hz pays it 60 times a
     // second. Only abgr/xbgr actually need the channels moved.
     const bool swap_rb = !is_rgb(format_.order());
-    auto* out = static_cast<std::uint8_t*>(staging_mapped_);
+    const auto row_bytes = static_cast<std::size_t>(w) * 4;
+    auto* out = static_cast<std::uint8_t*>(staging_mapped_) +
+                static_cast<std::size_t>(y0) * row_bytes;
+    const std::uint32_t* in0 = src + static_cast<std::size_t>(y0) * src_stride_px;
+
     if (!swap_rb) {
-        const auto row_bytes = static_cast<std::size_t>(w) * 4;
         if (static_cast<std::uint32_t>(src_stride_px) == w) {
-            // Tightly packed: one copy for the whole surface.
-            std::memcpy(out, src, row_bytes * h);
+            // Tightly packed: one copy for the whole damaged span.
+            std::memcpy(out, in0, row_bytes * n);
         } else {
-            for (std::uint32_t y = 0; y < h; ++y)
+            for (std::uint32_t y = 0; y < n; ++y)
                 std::memcpy(out + static_cast<std::size_t>(y) * row_bytes,
-                            src + static_cast<std::size_t>(y) * src_stride_px, row_bytes);
+                            in0 + static_cast<std::size_t>(y) * src_stride_px, row_bytes);
         }
     } else {
-        for (std::uint32_t y = 0; y < h; ++y) {
-            const std::uint32_t* in = src + static_cast<std::size_t>(y) * src_stride_px;
-            std::uint8_t* row = out + static_cast<std::size_t>(y) * w * 4;
+        for (std::uint32_t y = 0; y < n; ++y) {
+            const std::uint32_t* in = in0 + static_cast<std::size_t>(y) * src_stride_px;
+            std::uint8_t* row = out + static_cast<std::size_t>(y) * row_bytes;
             for (std::uint32_t x = 0; x < w; ++x, row += 4) {
                 const std::uint32_t p = in[x];
                 row[0] = static_cast<std::uint8_t>(p >> 16);   // r
@@ -945,23 +970,37 @@ Status VulkanImage::write(const std::uint32_t* src, std::int32_t src_stride_px) 
         }
     }
 
+    // A partial upload must PRESERVE the rows it isn't writing, so the old
+    // layout has to be honoured instead of discarded. UNDEFINED tells the
+    // driver the contents may be thrown away, which for a damage upload would
+    // leave the rest of the window as garbage.
+    const bool whole = (y0 == 0 && n == full_h);
+    const VkImageLayout old_layout = (whole || !laid_out_)
+                                        ? VK_IMAGE_LAYOUT_UNDEFINED
+                                        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
     VkBuffer staging = staging_;
     const auto status = device_.run_now([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;   // contents are being replaced
+        to_dst.oldLayout = old_layout;
         to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         to_dst.image = image_;
         to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        to_dst.srcAccessMask = whole ? 0 : VK_ACCESS_SHADER_READ_BIT;
         to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                              &to_dst);
 
+        // Both the buffer offset and the image offset name the same rows, so
+        // only the damaged band crosses the bus.
         VkBufferImageCopy copy{};
+        copy.bufferOffset = static_cast<VkDeviceSize>(y0) * row_bytes;
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.imageExtent = {w, h, 1};
+        copy.imageOffset = {0, static_cast<std::int32_t>(y0), 0};
+        copy.imageExtent = {w, n, 1};
         vkCmdCopyBufferToImage(cmd, staging, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                &copy);
 

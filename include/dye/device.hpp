@@ -195,14 +195,38 @@ public:
 
     /// Put pixels INTO the image, from premultiplied ARGB32.
     ///
-    /// The other direction, and equally not for the hot path. A compositor
-    /// needs it for surfaces it draws itself — a cursor, a fallback
-    /// background, a client's shared-memory buffer that has to become a
-    /// texture. A client's GPU buffer is never written this way; it is
-    /// imported and sampled where it already is.
+    /// This IS the hot path, unlike read() above. Every shared-memory client
+    /// becomes a texture this way — foot, and every GTK app — once per
+    /// commit, on the compositor's loop thread. A fullscreen terminal
+    /// redrawing at 60 Hz calls it 60 times a second, so its cost is a
+    /// direct tax on how many busy windows a compositor can show. See
+    /// tests/bench_upload.cpp; the numbers are measured, not assumed.
+    ///
+    /// A client's GPU buffer is never written this way; it is imported and
+    /// sampled where it already is.
     ///
     /// `src_stride_px` is in PIXELS, for the same reason as above.
     virtual Status write(const std::uint32_t* src, std::int32_t src_stride_px) = 0;
+
+    /// The same, but only the rows in [y, y + height).
+    ///
+    /// A client that tells us what it changed should not have the whole
+    /// surface re-uploaded: wl_surface.damage on a terminal is usually one
+    /// line of it. `src` still points at the START of the buffer and
+    /// `src_stride_px` still describes the whole thing, so the caller does no
+    /// pointer arithmetic and cannot get the offset wrong.
+    ///
+    /// Rows, not a rectangle, because a partial-width copy costs one command
+    /// per row while a row range is one: the win is in not touching the
+    /// untouched 90% of a scrolling terminal, and that is already rows.
+    ///
+    /// The default does a full write, so an implementation may ignore this.
+    virtual Status write_rows(const std::uint32_t* src, std::int32_t src_stride_px,
+                              std::int32_t y, std::int32_t height) {
+        (void)y;
+        (void)height;
+        return write(src, src_stride_px);
+    }
 
 protected:
     Image() = default;

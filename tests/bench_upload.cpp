@@ -88,6 +88,14 @@ int main() {
         std::printf("  %-24s %6.2f ms  (memcpy floor %.2f, %4.1f%% of a frame, ~%.0f fit)%s\n",
                     c.what, up_ms, floor_ms, up_ms / kFrameMs * 100.0, fit,
                     up_ms > kFrameMs / 4 ? "  <-- too slow" : "");
+
+        // And the case that is actually typical: a terminal scrolls, so one
+        // band of rows changed and the rest did not. A compositor that
+        // ignores wl_surface.damage pays the full number above for this.
+        const std::int32_t band = c.h / 10;
+        const double dmg_ms = ms_per(20, [&] { (void)(*image)->write_rows(src.data(), c.w, 0, band); });
+        std::printf("  %-24s %6.2f ms  (10%% damaged: %.1fx cheaper)\n", "  ^ 10% of it",
+                    dmg_ms, dmg_ms > 0 ? up_ms / dmg_ms : 0);
     }
 
     std::printf("\n  Every number above is paid on the compositor's LOOP THREAD,\n");
