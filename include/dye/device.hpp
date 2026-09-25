@@ -54,7 +54,9 @@
 // layer) does not drag in a GPU stack.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -191,6 +193,17 @@ public:
     /// and this is how its pixels are obtained at all.
     virtual Status read(std::uint32_t* dst, std::int32_t dst_stride_px) = 0;
 
+    /// Put pixels INTO the image, from premultiplied ARGB32.
+    ///
+    /// The other direction, and equally not for the hot path. A compositor
+    /// needs it for surfaces it draws itself — a cursor, a fallback
+    /// background, a client's shared-memory buffer that has to become a
+    /// texture. A client's GPU buffer is never written this way; it is
+    /// imported and sampled where it already is.
+    ///
+    /// `src_stride_px` is in PIXELS, for the same reason as above.
+    virtual Status write(const std::uint32_t* src, std::int32_t src_stride_px) = 0;
+
 protected:
     Image() = default;
 
@@ -294,6 +307,48 @@ public:
     [[nodiscard]] virtual Result<BufferDescription> allocate(std::int32_t width,
                                                              std::int32_t height,
                                                              Format format) = 0;
+
+    // -- the seam with the renderer -----------------------------------------
+    //
+    // The renderer needs this device's actual Vulkan objects, and nothing
+    // else does. Rather than make Device concrete (which would drag the
+    // Vulkan headers into every file that mentions a GPU) or make the
+    // renderer a friend (which would tie their lifetimes together), the
+    // handles are exposed through one opaque struct.
+    //
+    // `Handles` is declared but not defined here: only src/*.cpp ever sees
+    // its members, so this header still costs nothing to include.
+
+    /// This device's Vulkan objects.
+    ///
+    /// Deliberately opaque POINTERS rather than Vulkan types: this header
+    /// must not include vulkan.h, or every file that mentions a GPU pays
+    /// for it. src/renderer.cpp casts them back, and it is the only file
+    /// that may.
+    struct Handles {
+        void*         device = nullptr;           // VkDevice
+        void*         graphics_queue = nullptr;   // VkQueue
+        std::uint32_t graphics_family = 0;
+
+        /// The image view a TextureId names, or null if this device never
+        /// issued it. An id from ANOTHER device must not resolve: rendering
+        /// with it would read whatever that number happens to hit.
+        std::function<void*(TextureId)> view_of;
+        /// The image behind one of our own Images, for use as a target.
+        std::function<void*(Image&)> image_of;
+    };
+
+    /// This device's Vulkan objects, or null on a build without Vulkan.
+    [[nodiscard]] virtual Handles* vulkan_handles() noexcept = 0;
+
+    /// A memory type satisfying `bits` with all of `properties`.
+    ///
+    /// Exposed because the renderer allocates its own instance buffer and
+    /// must make the same choice this device would. The bug it exists to
+    /// avoid: host-visible memory on a discrete GPU is uncached by default,
+    /// and reading it is 100x slower than reading cached memory.
+    [[nodiscard]] virtual std::optional<std::uint32_t> memory_type_index(
+        std::uint32_t bits, std::uint32_t properties) const noexcept = 0;
 
 protected:
     Device() = default;

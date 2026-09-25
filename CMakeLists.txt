@@ -63,8 +63,34 @@ pkg_check_modules(DYE_GPU IMPORTED_TARGET vulkan)
 # The device layer is compiled: one source with the EGL headers, or a stub
 # that reports "no GPU backend" as an ordinary error. Which one is a build
 # decision, so no call site needs an #ifdef.
+# Shaders are compiled to SPIR-V at BUILD time and embedded in the binary.
+# A compositor must not compile a shader at startup (it is milliseconds of
+# stutter on the first frame) and must not read one from disk (a missing
+# file at runtime is a black screen).
+find_program(GLSLC glslc)
+if(DYE_GPU_FOUND AND NOT GLSLC)
+  message(WARNING "dye: glslc not found - GPU renderer disabled")
+  set(DYE_GPU_FOUND FALSE)
+endif()
+
 if(DYE_GPU_FOUND)
-  set(DYE_DEVICE_SOURCE src/device.cpp)
+  set(DYE_SHADERS "")
+  foreach(shader quad.vert quad.frag)
+    set(_in  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader})
+    set(_out ${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.h)
+    add_custom_command(
+      OUTPUT ${_out}
+      # -mfmt=c emits a C array, so the SPIR-V is #included rather than
+      # loaded: no file to find, no path to get wrong, no startup I/O.
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
+      COMMAND ${GLSLC} -O -mfmt=c ${_in} -o ${_out}
+      DEPENDS ${_in}
+      COMMENT "dye: compiling ${shader} to SPIR-V")
+    list(APPEND DYE_SHADERS ${_out})
+  endforeach()
+  add_custom_target(dye_shaders DEPENDS ${DYE_SHADERS})
+
+  set(DYE_DEVICE_SOURCE src/device.cpp src/fence.cpp src/renderer.cpp)
   message(STATUS "dye: GPU backend enabled (Vulkan)")
 else()
   set(DYE_DEVICE_SOURCE src/device_none.cpp)
@@ -80,6 +106,8 @@ target_compile_features(dye PUBLIC cxx_std_23)
 target_link_libraries(dye PUBLIC jaal::jaal weft::weft)
 if(DYE_GPU_FOUND)
   target_link_libraries(dye PRIVATE PkgConfig::DYE_GPU)
+  target_include_directories(dye PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  add_dependencies(dye dye_shaders)
 endif()
 target_compile_options(dye PRIVATE -Wall -Wextra)
 set_target_properties(dye PROPERTIES EXPORT_NAME dye)
@@ -115,7 +143,8 @@ endif()
 enable_testing()
 
 add_executable(dye_tests tests/test_format.cpp tests/test_buffer.cpp
-                         tests/test_cpu.cpp tests/test_device.cpp tests/main.cpp)
+                         tests/test_cpu.cpp tests/test_device.cpp
+                         tests/test_parity.cpp tests/main.cpp)
 target_link_libraries(dye_tests PRIVATE dye)
 target_compile_options(dye_tests PRIVATE -Wall -Wextra)
 add_test(NAME format COMMAND dye_tests)

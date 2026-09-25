@@ -13,6 +13,7 @@ void run_format_tests();
 void run_buffer_tests();
 void run_cpu_tests();
 void run_device_tests();
+void run_parity_tests();
 
 int main() {
     std::printf("dye\n\n");
@@ -20,6 +21,7 @@ int main() {
     run_buffer_tests();
     run_cpu_tests();
     run_device_tests();
+    run_parity_tests();
     std::printf("\n%s\n", dye_test_failures ? "FAILED" : "all passed");
     return dye_test_failures ? 1 : 0;
 }

@@ -17,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <unordered_map>
 #include <optional>
 
 namespace dye {
@@ -304,6 +305,14 @@ public:
     ~VulkanImage() override;
 
     Status read(std::uint32_t* dst, std::int32_t dst_stride_px) override;
+    Status write(const std::uint32_t* src, std::int32_t src_stride_px) override;
+
+private:
+    /// The staging buffer both directions share: made once, kept mapped,
+    /// grown only when a bigger image needs it.
+    Status ensure_staging(VkDeviceSize bytes);
+
+public:
 
     [[nodiscard]] VkImage vk_image() const noexcept { return image_; }
     [[nodiscard]] VkImageView vk_view() const noexcept { return view_; }
@@ -348,6 +357,20 @@ public:
     Result<BufferDescription> allocate(std::int32_t width, std::int32_t height,
                                        Format format) override;
 
+    Handles* vulkan_handles() noexcept override { return &handles_; }
+
+    /// Drop a destroyed image's id, so a later id cannot resolve to freed
+    /// memory. Called from ~VulkanImage.
+    void forget_texture(TextureId id) {
+        views_.erase(id.raw());
+        images_.erase(id.raw());
+    }
+
+    std::optional<std::uint32_t> memory_type_index(std::uint32_t bits,
+                                                   std::uint32_t properties) const noexcept override {
+        return memory_type(bits, static_cast<VkMemoryPropertyFlags>(properties));
+    }
+
     static Result<std::unique_ptr<Device>> create(Candidate c);
 
     // -- used by VulkanImage ------------------------------------------------
@@ -384,6 +407,17 @@ private:
     DeviceInfo       info_{};
     std::vector<Layout> formats_;
     VkPhysicalDeviceMemoryProperties memory_{};
+    Handles          handles_{};
+
+    /// Every image this device made, by texture id.
+    ///
+    /// The renderer is given ids, not pointers, so this is how one is turned
+    /// back into something Vulkan understands. An id this device did not
+    /// make is absent rather than wrong, which is what stops a texture from
+    /// one GPU being rendered on another.
+    std::unordered_map<std::uint32_t, VkImageView> views_;
+    std::unordered_map<std::uint32_t, VkImage> images_;
+    std::uint32_t next_texture_id_ = 1;
 
     PFN_vkGetMemoryFdKHR get_memory_fd_ = nullptr;
 };
@@ -603,7 +637,13 @@ Result<std::unique_ptr<Image>> VulkanDevice::import(BufferDescription d) {
     out->size_ = {d.width, d.height};
     out->format_ = d.layout.format;
     out->y_invert_ = d.y_invert;
-    out->texture_ = TextureId{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(view))};
+    // A sequential id, registered here. It used to be the view POINTER cast
+    // to 32 bits, which on a 64-bit build silently discarded half of it —
+    // two images could collide, and the renderer would draw the wrong one.
+    const std::uint32_t id = next_texture_id_++;
+    views_[id] = view;
+    images_[id] = image;
+    out->texture_ = TextureId{id};
 
     cleanup.armed = false;
     // `d` dies here, and with it the client's descriptors. The driver has
@@ -743,6 +783,7 @@ Result<BufferDescription> VulkanDevice::allocate(std::int32_t width, std::int32_
 VulkanImage::~VulkanImage() {
     VkDevice dev = device_.vk();
     if (dev == VK_NULL_HANDLE) return;
+    device_.forget_texture(texture_);
     if (staging_mapped_) vkUnmapMemory(dev, staging_memory_);
     if (staging_) vkDestroyBuffer(dev, staging_, nullptr);
     if (staging_memory_) vkFreeMemory(dev, staging_memory_, nullptr);
@@ -751,18 +792,9 @@ VulkanImage::~VulkanImage() {
     if (memory_) vkFreeMemory(dev, memory_, nullptr);
 }
 
-Status VulkanImage::read(std::uint32_t* dst, std::int32_t dst_stride_px) {
-    if (!dst) return fail(std::errc::invalid_argument, "read() needs somewhere to write");
-    if (size_.empty()) return fail(std::errc::invalid_argument, "the image has no pixels");
-    if (dst_stride_px < size_.width)
-        return fail(std::errc::invalid_argument, "the destination stride is too small");
-
+Status VulkanImage::ensure_staging(VkDeviceSize bytes) {
     VkDevice dev = device_.vk();
-    const auto w = static_cast<std::uint32_t>(size_.width);
-    const auto h = static_cast<std::uint32_t>(size_.height);
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 4;
-
-    // The staging buffer, made once and kept mapped.
+    // Made once and kept mapped, for both read() and write().
     //
     // The image itself is very likely tiled and device-local, so it cannot
     // be mapped — copying through a buffer is not a detour, it is the only
@@ -826,6 +858,94 @@ Status VulkanImage::read(std::uint32_t* dst, std::int32_t dst_stride_px) {
 
         staging_size_ = bytes;
     }
+    return Status{};
+}
+
+Status VulkanImage::write(const std::uint32_t* src, std::int32_t src_stride_px) {
+    if (!src) return fail(std::errc::invalid_argument, "write() needs something to copy");
+    if (size_.empty()) return fail(std::errc::invalid_argument, "the image has no pixels");
+    if (src_stride_px < size_.width)
+        return fail(std::errc::invalid_argument, "the source stride is too small");
+
+    VkDevice dev = device_.vk();
+    const auto w = static_cast<std::uint32_t>(size_.width);
+    const auto h = static_cast<std::uint32_t>(size_.height);
+
+    if (auto s = ensure_staging(static_cast<VkDeviceSize>(w) * h * 4); !s) return s;
+
+    // Premultiplied ARGB32 into the image's own channel order. The same
+    // mapping read() undoes, written once in each direction rather than a
+    // format switch in the copy loop.
+    const bool swap_rb = !is_rgb(format_.order());
+    auto* out = static_cast<std::uint8_t*>(staging_mapped_);
+    for (std::uint32_t y = 0; y < h; ++y) {
+        const std::uint32_t* in = src + static_cast<std::size_t>(y) * src_stride_px;
+        std::uint8_t* row = out + static_cast<std::size_t>(y) * w * 4;
+        for (std::uint32_t x = 0; x < w; ++x, row += 4) {
+            const std::uint32_t p = in[x];
+            const std::uint8_t b = static_cast<std::uint8_t>(p);
+            const std::uint8_t g = static_cast<std::uint8_t>(p >> 8);
+            const std::uint8_t r = static_cast<std::uint8_t>(p >> 16);
+            const std::uint8_t a = static_cast<std::uint8_t>(p >> 24);
+            row[0] = swap_rb ? r : b;
+            row[1] = g;
+            row[2] = swap_rb ? b : r;
+            row[3] = a;
+        }
+    }
+
+    VkBuffer staging = staging_;
+    const auto status = device_.run_now([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;   // contents are being replaced
+        to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.image = image_;
+        to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_dst);
+
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cmd, staging, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &copy);
+
+        // Back to a layout the renderer can sample. Without this the first
+        // draw reads an image still in TRANSFER_DST, which is undefined.
+        VkImageMemoryBarrier to_read{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_read.image = image_;
+        to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1, &to_read);
+    });
+    if (!status) return status;
+    laid_out_ = true;
+    return Status{};
+}
+
+Status VulkanImage::read(std::uint32_t* dst, std::int32_t dst_stride_px) {
+    if (!dst) return fail(std::errc::invalid_argument, "read() needs somewhere to write");
+    if (size_.empty()) return fail(std::errc::invalid_argument, "the image has no pixels");
+    if (dst_stride_px < size_.width)
+        return fail(std::errc::invalid_argument, "the destination stride is too small");
+
+    VkDevice dev = device_.vk();
+    const auto w = static_cast<std::uint32_t>(size_.width);
+    const auto h = static_cast<std::uint32_t>(size_.height);
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 4;
+
+    if (auto st = ensure_staging(bytes); !st) return st;
     VkBuffer staging = staging_;
 
     // The transition is from UNDEFINED the first time (the client's contents
@@ -941,6 +1061,22 @@ Result<std::unique_ptr<Device>> VulkanDevice::create(Candidate c) {
     pci.queueFamilyIndex = d->families_.graphics;
     r = vkCreateCommandPool(d->device_, &pci, nullptr, &d->command_pool_);
     if (r != VK_SUCCESS) return fail_vk(r, "vkCreateCommandPool() failed");
+
+    // The renderer's seam. Lambdas rather than raw maps so an id this
+    // device never issued resolves to null instead of to whatever that
+    // number happens to hit.
+    auto* self = d.get();
+    d->handles_.device = d->device_;
+    d->handles_.graphics_queue = d->graphics_queue_;
+    d->handles_.graphics_family = d->families_.graphics;
+    d->handles_.view_of = [self](TextureId id) -> void* {
+        const auto it = self->views_.find(id.raw());
+        return it == self->views_.end() ? nullptr : static_cast<void*>(it->second);
+    };
+    d->handles_.image_of = [self](Image& img) -> void* {
+        const auto it = self->images_.find(img.texture().raw());
+        return it == self->images_.end() ? nullptr : static_cast<void*>(it->second);
+    };
 
     d->query_formats();
     if (d->formats_.empty())
