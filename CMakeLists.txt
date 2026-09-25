@@ -53,17 +53,22 @@ endif()
 # depends on them.
 # ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(DYE_GPU IMPORTED_TARGET egl gbm glesv2)
+# Vulkan, not EGL. The deciding measurement is in DESIGN.md §1: on NVIDIA,
+# EGL advertises 48 ARGB8888 layouts with no LINEAR among them and refuses
+# to import a linear dmabuf at all, while Vulkan reports LINEAR and imports
+# it. A compositor on EGL+NVIDIA cannot accept the one layout a
+# software-rendering client can produce.
+pkg_check_modules(DYE_GPU IMPORTED_TARGET vulkan)
 
 # The device layer is compiled: one source with the EGL headers, or a stub
 # that reports "no GPU backend" as an ordinary error. Which one is a build
 # decision, so no call site needs an #ifdef.
 if(DYE_GPU_FOUND)
   set(DYE_DEVICE_SOURCE src/device.cpp)
-  message(STATUS "dye: GPU backend enabled (EGL + GBM + GLES2)")
+  message(STATUS "dye: GPU backend enabled (Vulkan)")
 else()
   set(DYE_DEVICE_SOURCE src/device_none.cpp)
-  message(STATUS "dye: no EGL/GBM/GLES2 — building without a GPU backend")
+  message(STATUS "dye: no Vulkan — building without a GPU backend")
 endif()
 
 add_library(dye STATIC ${DYE_DEVICE_SOURCE})

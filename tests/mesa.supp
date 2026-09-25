@@ -1,0 +1,41 @@
+# mesa.supp — descriptors and allocations the Mesa drivers keep for the
+# lifetime of the process.
+#
+# These are NOT dye's, and the distinction matters: valgrind's --track-fds is
+# how the "an imported image does not hold the client's descriptors" test is
+# really enforced, and a suite that is red for three unrelated reasons is a
+# suite people stop running.
+#
+# Each entry names the exact Mesa frame that opens the descriptor. A leak in
+# dye's own code has dye:: frames in its stack and is not matched by any of
+# these, which is the property that keeps these suppressions honest.
+
+# llvmpipe opens an anonymous file when its screen is created, during
+# vkEnumeratePhysicalDevices. It lives until the process exits.
+{
+   mesa-llvmpipe-screen-anonymous-file
+   CoreError:FdNotClosed
+   fun:memfd_create
+   fun:os_create_anonymous_file
+   ...
+   fun:lvp_enumerate_physical_devices
+   ...
+}
+
+# ...and a second for its fence machinery, same lifetime.
+{
+   mesa-llvmpipe-fence-dmabuf
+   CoreError:FdNotClosed
+   fun:memfd_create
+   fun:llvmpipe_dmabuf_alloc
+   ...
+}
+
+# /dev/udmabuf, opened once by the software driver.
+{
+   mesa-udmabuf
+   CoreError:FdNotClosed
+   ...
+   fun:llvmpipe_create_screen
+   ...
+}

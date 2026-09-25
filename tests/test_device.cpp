@@ -27,10 +27,16 @@ namespace {
 
 int skipped = 0;
 
-/// The GPU, opened once: EGL initialisation is slow and every test wants the
-/// same device.
+/// The GPU, opened once: device creation is slow and every test wants the
+/// same one.
+///
+/// open_any(), not open(): a test wants llvmpipe when there is no real GPU,
+/// because it runs everywhere and is a genuine Vulkan implementation. A
+/// COMPOSITOR must never silently fall back to it — a desktop at 4 fps with
+/// no explanation is worse than one that says it found no GPU — which is
+/// why they are separate entry points.
 Device* gpu() {
-    static auto opened = Device::open();
+    static auto opened = Device::open_any();
     return opened ? opened->get() : nullptr;
 }
 
@@ -39,7 +45,7 @@ Device* gpu() {
 void opening_reports_why_it_failed() {
     std::printf("opening a GPU either works or says why\n");
 
-    auto d = Device::open();
+    auto d = Device::open_any();
     if (!d) {
         // Not a failure. But the error has to be usable: a compositor prints
         // it and falls back to the CPU renderer, and "" tells nobody
@@ -51,16 +57,122 @@ void opening_reports_why_it_failed() {
         return;
     }
 
-    CHECK(!(*d)->node().empty());
-    CHECK((*d)->device_id() != 0);
-    std::printf("  %.*s, device %llu\n", static_cast<int>((*d)->node().size()),
-                (*d)->node().data(),
-                static_cast<unsigned long long>((*d)->device_id()));
+    const DeviceInfo& info = (*d)->info();
+    CHECK(!info.name.empty());
+    CHECK(info.usable);
+    std::printf("  %s (%s, driver %s)\n", info.name.c_str(), describe(info.kind).data(),
+                info.driver.empty() ? "?" : info.driver.c_str());
 
-    // A node that does not exist fails cleanly rather than crashing.
-    auto bad = Device::open("/dev/dri/renderD999");
+    // A real GPU reports its DRM nodes; a software one has none, which is
+    // how llvmpipe is identified rather than by matching on its name.
+    if (info.is_software()) {
+        CHECK(!info.render_node.valid());
+        CHECK(!info.primary_node.valid());
+        std::printf("  software renderer: no DRM nodes, as expected\n");
+    } else {
+        CHECK(info.render_node.valid() || info.primary_node.valid());
+        std::printf("  drm nodes: render %u:%u  primary %u:%u\n", info.render_node.major,
+                    info.render_node.minor, info.primary_node.major, info.primary_node.minor);
+    }
+
+    // A device number nobody owns fails cleanly rather than crashing.
+    auto bad = Device::open(DeviceNumber{226, 250});
     CHECK(!bad.has_value());
     CHECK(!bad.error().what.empty());
+
+    // And an invalid one is rejected before any lookup.
+    auto zero = Device::open(DeviceNumber{});
+    CHECK(!zero.has_value());
+    CHECK(zero.error().code == std::errc::invalid_argument);
+}
+
+void enumeration_reports_unusable_gpus_too() {
+    std::printf("every GPU is listed, with a reason when it cannot be used\n");
+
+    auto gpus = enumerate_gpus();
+    if (!gpus) {
+        CHECK(!gpus.error().what.empty());
+        std::printf("  SKIP: %s\n", gpus.error().what.data());
+        ++skipped;
+        return;
+    }
+
+    CHECK(!gpus->empty());
+    for (const DeviceInfo& i : *gpus) {
+        CHECK(!i.name.empty());
+        // An unusable device must SAY why. "No GPU" on a machine with a
+        // visible card is the least helpful message a compositor can print,
+        // and this is the field that prevents it.
+        if (!i.usable) CHECK(!i.unusable_because.empty());
+        std::printf("  %-34s %-11s %s\n", i.name.c_str(), describe(i.kind).data(),
+                    i.usable ? "usable" : i.unusable_because.c_str());
+    }
+}
+
+void a_device_is_found_by_its_drm_node() {
+    std::printf("a GPU is found by its DRM node, not by its name\n");
+
+    auto gpus = enumerate_gpus();
+    if (!gpus) {
+        std::printf("  SKIP: no Vulkan\n");
+        ++skipped;
+        return;
+    }
+
+    // The multi-GPU entry point. Matching on a device NAME instead is how a
+    // compositor picks the wrong card on a machine with two of the same
+    // model — and the DRM node is what heddle's enumeration hands over.
+    const DeviceInfo* real = nullptr;
+    for (const DeviceInfo& i : *gpus)
+        if (i.usable && i.render_node.valid()) real = &i;
+    if (!real) {
+        std::printf("  SKIP: no GPU reports a DRM render node\n");
+        ++skipped;
+        return;
+    }
+
+    auto by_node = Device::open(real->render_node);
+    CHECK(by_node.has_value());
+    if (by_node) {
+        CHECK((*by_node)->info().name == real->name);
+        CHECK((*by_node)->info().render_node == real->render_node);
+    }
+
+    // The PRIMARY node must find the same device. A compositor holding a
+    // primary node (from heddle, for scanout) and one holding the render
+    // node must agree about which GPU they mean.
+    if (real->primary_node.valid()) {
+        auto by_primary = Device::open(real->primary_node);
+        CHECK(by_primary.has_value());
+        if (by_primary) CHECK((*by_primary)->info().name == real->name);
+        std::printf("  render %u:%u and primary %u:%u are the same GPU\n",
+                    real->render_node.major, real->render_node.minor,
+                    real->primary_node.major, real->primary_node.minor);
+    }
+}
+
+void two_devices_negotiate_a_shared_layout() {
+    std::printf("two GPUs agree on a layout, or the caller learns they cannot\n");
+    Device* d = gpu();
+    if (!d) {
+        std::printf("  SKIP: no GPU\n");
+        ++skipped;
+        return;
+    }
+
+    // A device shares every layout with itself: the trivial case, but it is
+    // the one a single-GPU machine takes, and it must not be empty.
+    const auto with_self = d->shared_layouts(*d, formats::argb8888);
+    CHECK(!with_self.empty());
+    for (const Layout& l : with_self) {
+        CHECK(d->supports(l));
+        CHECK(l.format == formats::argb8888);
+    }
+
+    // Every shared layout is importable by BOTH. That is the property the
+    // whole multi-GPU scheme rests on: advertise the intersection and a
+    // client's buffer works on both by construction, rather than by luck.
+    std::printf("  %zu shared ARGB8888 layouts\n", with_self.size());
 }
 
 void the_format_list_is_honest() {
@@ -260,7 +372,10 @@ void importing_does_not_keep_the_client_s_descriptors() {
 
 void run_device_tests() {
     opening_reports_why_it_failed();
+    enumeration_reports_unusable_gpus_too();
+    a_device_is_found_by_its_drm_node();
     the_format_list_is_honest();
+    two_devices_negotiate_a_shared_layout();
     a_real_buffer_imports_and_reads_back();
     malformed_buffers_are_refused_before_the_driver();
     importing_does_not_keep_the_client_s_descriptors();

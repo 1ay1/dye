@@ -3,22 +3,39 @@
 //
 // What this is for
 // ----------------
-// A compositor needs four things from a GPU, and only four:
+// A compositor needs five things from a GPU, and only five:
 //
-//   * which formats and layouts it can actually import (formats())
+//   * which formats and layouts it can import          (formats())
 //   * turning a client's dmabuf into something samplable (import())
-//   * reading pixels back into memory (Image::read)
-//   * knowing when the GPU has finished (fences, fence.hpp)
+//   * allocating a buffer it can definitely import      (allocate())
+//   * reading pixels back into memory                   (Image::read)
+//   * knowing when the GPU has finished                 (fence.hpp)
 //
-// Everything else EGL offers is for drawing to a window, and a compositor
-// has no window.
+// Everything else a graphics API offers is for drawing to a window, and a
+// compositor has no window.
+//
+// Why Vulkan, not EGL
+// -------------------
+// Measured on this hardware (NVIDIA RTX 4060, proprietary driver), asked for
+// ARGB8888:
+//
+//                       EGL/GLES        Vulkan
+//   layouts offered     48              7
+//   of which LINEAR     0               1
+//   import a linear     REFUSED         works
+//   dmabuf              (BAD_PARAMETER)
+//
+// LINEAR is the one layout every client can produce without knowing anything
+// about the GPU. A compositor on EGL+NVIDIA cannot accept it. That single
+// result decided the API; the rest (native fd fences, per-modifier feature
+// flags, errors as return values) is corroborating. See DESIGN.md §1.
 //
 // Why it is optional
 // ------------------
-// There may be no GPU: a VM, a CI runner, a machine whose driver refused to
-// load. `Device::open()` then returns an error and the compositor uses the
-// CPU renderer, which is why dye's other layers know nothing about this one.
-// A library that made EGL mandatory would be untestable on exactly the
+// There may be no GPU: a VM, a CI runner, a driver that refused to load.
+// `Device::open()` returns an error and the compositor uses the CPU
+// renderer, which is why dye's other layers know nothing about this one. A
+// library that made Vulkan mandatory would be untestable on exactly the
 // machines tests run on.
 //
 // What it refuses to do
@@ -28,9 +45,13 @@
 // buffer ranges from a clean error to a GPU hang, and no compositor can ship
 // "it depends on the vendor" as its error handling.
 //
-// No EGL headers here. They live in src/device.cpp, so including this costs
-// nothing and code that only wants the types (a test, the protocol layer)
-// does not drag in a GL stack.
+// It does not find devices either. That is heddle's job (heddle/discover.hpp):
+// it is the DRM library, it already owns device nodes, and rendering does not
+// need to know what a CRTC is. dye is handed a DeviceNumber.
+//
+// No Vulkan headers here. They live in src/device.cpp, so including this
+// costs nothing and code that only wants the types (a test, the protocol
+// layer) does not drag in a GPU stack.
 
 #include <cstdint>
 #include <memory>
@@ -55,6 +76,77 @@ using Result = jaal::result<T>;
 using Status = Result<void>;
 
 // ---------------------------------------------------------------------------
+// DeviceNumber — which kernel device this is.
+//
+// Deliberately a plain pair of integers rather than a heddle type: it is the
+// entire vocabulary dye and heddle share, and keeping it this small is what
+// lets neither library include the other's headers.
+//
+// It is also exactly what VK_EXT_physical_device_drm reports, which is the
+// authoritative link between "this Vulkan device" and "this /dev/dri node".
+// Matching on a device NAME instead is how a compositor picks the wrong GPU
+// on a machine with two of the same model.
+// ---------------------------------------------------------------------------
+struct DeviceNumber {
+    std::uint32_t major = 0;
+    std::uint32_t minor = 0;
+
+    [[nodiscard]] constexpr bool valid() const noexcept { return major != 0; }
+    friend constexpr bool operator==(DeviceNumber, DeviceNumber) = default;
+};
+
+/// What a GPU is, roughly. For choosing between several, and for logs.
+enum class DeviceKind : std::uint8_t {
+    discrete,     ///< a separate card, its own memory
+    integrated,   ///< shares memory with the CPU
+    software,     ///< llvmpipe, lavapipe: correct and slow
+    other,
+};
+
+[[nodiscard]] constexpr std::string_view describe(DeviceKind k) noexcept {
+    switch (k) {
+        case DeviceKind::discrete:   return "discrete";
+        case DeviceKind::integrated: return "integrated";
+        case DeviceKind::software:   return "software";
+        case DeviceKind::other:      return "other";
+    }
+    return "unknown";
+}
+
+/// One GPU Vulkan can see, before it is opened.
+///
+/// Enumerating separately from opening is what makes multi-GPU tractable: a
+/// compositor can look at what exists, match it against the DRM device it
+/// wants, and only then pay the cost of creating a logical device.
+struct DeviceInfo {
+    std::string   name;            ///< "NVIDIA GeForce RTX 4060"
+    std::string   driver;          ///< "NVIDIA", "radv", "llvmpipe"
+    DeviceKind    kind = DeviceKind::other;
+
+    /// The DRM nodes this GPU owns, from VK_EXT_physical_device_drm.
+    /// Both are invalid for a software device — which is how llvmpipe is
+    /// identified, rather than by matching on its name.
+    DeviceNumber  render_node{};
+    DeviceNumber  primary_node{};
+
+    /// Can it do what a compositor needs: import dmabufs, export fences?
+    /// False means it is a perfectly good GPU for something else.
+    bool          usable = false;
+
+    /// Why not, when usable is false. A compositor prints this rather than
+    /// saying "no GPU" on a machine that visibly has one.
+    std::string   unusable_because{};
+
+    [[nodiscard]] bool is_software() const noexcept { return kind == DeviceKind::software; }
+};
+
+/// Every GPU Vulkan can see, whether usable or not.
+///
+/// Returns the unusable ones too, with a reason. A compositor that silently
+/// skipped them would tell a user with a working card that there is no GPU.
+[[nodiscard]] Result<std::vector<DeviceInfo>> enumerate_gpus();
+
+// ---------------------------------------------------------------------------
 // Image — a client's buffer, now something the GPU can sample.
 // ---------------------------------------------------------------------------
 
@@ -77,7 +169,7 @@ public:
     [[nodiscard]] Format format() const noexcept { return format_; }
     [[nodiscard]] bool y_invert() const noexcept { return y_invert_; }
 
-    /// The texture, for a GL renderer to bind.
+    /// The texture, for the renderer to bind.
     [[nodiscard]] TextureId texture() const noexcept { return texture_; }
 
     /// As a draw-list source, so a compositor does not restate the three
@@ -89,10 +181,14 @@ public:
 
     /// Copy the pixels into main memory as premultiplied ARGB32.
     ///
-    /// This is the slow path, and deliberately so: it exists for the CPU
-    /// renderer and for screen capture, not for compositing. `dst_stride_px`
-    /// is in PIXELS, unlike every framebuffer API's byte stride — which is
-    /// why it is in the name.
+    /// The slow path, and deliberately so: it exists for the CPU renderer,
+    /// for screen capture and for the parity test, not for compositing.
+    /// `dst_stride_px` is in PIXELS, unlike every framebuffer API's byte
+    /// stride — which is why it is in the name.
+    ///
+    /// Works whatever the layout. That is the point of going through the GPU
+    /// rather than mapping the memory: a tiled buffer cannot be memcpy'd,
+    /// and this is how its pixels are obtained at all.
     virtual Status read(std::uint32_t* dst, std::int32_t dst_stride_px) = 0;
 
 protected:
@@ -105,15 +201,15 @@ protected:
 };
 
 // ---------------------------------------------------------------------------
-// Device — one GPU.
+// Device — one GPU, opened.
 // ---------------------------------------------------------------------------
 
-/// A render node, opened for import and drawing.
+/// A GPU, ready to import and draw.
 ///
-/// Abstract so the GL implementation can live in one .cpp with the EGL
+/// Abstract so the Vulkan implementation lives in one .cpp with the Vulkan
 /// headers, and so a test can substitute a device that imports nothing. The
-/// alternative — a concrete class with void* members — is what tapestry had,
-/// and it made every test of the import path need a GPU.
+/// alternative — a concrete class full of opaque handles — is what the EGL
+/// backend was, and it made every test of the import path need a GPU.
 class Device {
 public:
     virtual ~Device() = default;
@@ -121,22 +217,32 @@ public:
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
 
-    /// Open the first usable render node (/dev/dri/renderD*).
+    /// Open the best usable GPU.
     ///
-    /// An error rather than an exception or a null: "there is no GPU here"
-    /// is an ordinary state on a VM or a CI runner, and the caller's
-    /// response is to use the CPU renderer, not to abort.
+    /// "Best" is discrete, then integrated, then software. A compositor that
+    /// wants a specific one uses the DeviceNumber overload; this is for the
+    /// ordinary single-GPU case, which must not require a machine's worth of
+    /// enumeration code in every caller.
     [[nodiscard]] static Result<std::unique_ptr<Device>> open();
 
-    /// Open one specific node, for a machine with two GPUs.
-    [[nodiscard]] static Result<std::unique_ptr<Device>> open(const char* node);
+    /// Open the GPU that owns this DRM node.
+    ///
+    /// The multi-GPU entry point, and the one a compositor should use: the
+    /// number comes from heddle's enumeration, and matching on it rather
+    /// than on a device name is what picks the right card on a machine with
+    /// two of the same model.
+    [[nodiscard]] static Result<std::unique_ptr<Device>> open(DeviceNumber drm_node);
 
-    /// The node this is, for logs: "/dev/dri/renderD128".
-    [[nodiscard]] virtual std::string_view node() const noexcept = 0;
+    /// Open a device for tests, allowing a software one.
+    ///
+    /// Separate because a compositor must never silently fall back to
+    /// llvmpipe — a desktop rendering at 4 fps with no explanation is worse
+    /// than one that says it found no GPU. A test, meanwhile, wants
+    /// llvmpipe: it runs everywhere and it is a real Vulkan implementation.
+    [[nodiscard]] static Result<std::unique_ptr<Device>> open_any();
 
-    /// The device id (st_rdev), which is what a compositor advertises to
-    /// clients so they allocate on the same GPU (linux-dmabuf's main_device).
-    [[nodiscard]] virtual std::uint64_t device_id() const noexcept = 0;
+    /// What this device is, and which kernel nodes it owns.
+    [[nodiscard]] virtual const DeviceInfo& info() const noexcept = 0;
 
     /// Every format and layout this GPU can import.
     ///
@@ -152,9 +258,23 @@ public:
         return false;
     }
 
+    /// The layouts BOTH devices can handle, for a format.
+    ///
+    /// The multi-GPU negotiation, in one place. A client's buffer must be
+    /// importable by the GPU that composites AND by the GPU that scans out;
+    /// advertising the intersection means that holds by construction rather
+    /// than by luck.
+    ///
+    /// An empty result is meaningful: the two GPUs share no layout, so every
+    /// frame needs a copy. A compositor should say so once, in a log line —
+    /// one that silently copies every frame is slow for reasons nobody can
+    /// find, and one that does not notice renders black.
+    [[nodiscard]] std::vector<Layout> shared_layouts(const Device& other,
+                                                     Format format) const;
+
     /// Import a client's buffer.
     ///
-    /// `d` must already have passed dye::validate: this checks what only the
+    /// `d` is checked by dye::validate first: this reports only what the
     /// driver knows (can it take this layout), not what arithmetic can
     /// answer. Takes the description BY VALUE because importing consumes the
     /// descriptors.
@@ -164,14 +284,13 @@ public:
     ///
     /// A compositor needs this for its own surfaces (a cursor, a scratch
     /// target), and a test needs it because a hand-made buffer may be in a
-    /// layout the driver refuses. NVIDIA's proprietary driver is the case
-    /// that forced this: it advertises 48 layouts, every one of them its own
-    /// tiling, and refuses DRM_FORMAT_MOD_LINEAR outright — so "allocate a
-    /// linear buffer and import it" works on Intel and AMD and cannot work
-    /// there at all.
+    /// layout the driver refuses.
     ///
-    /// The layout is the driver's choice from what it supports. The returned
-    /// description says which, and carries the descriptors.
+    /// The layout is the driver's choice from what it supports, and the
+    /// returned description says which. Asking for LINEAR specifically is
+    /// what does not work on NVIDIA through EGL; through Vulkan it does, but
+    /// letting the driver choose is still right — it picks something it can
+    /// render to efficiently.
     [[nodiscard]] virtual Result<BufferDescription> allocate(std::int32_t width,
                                                              std::int32_t height,
                                                              Format format) = 0;
@@ -182,9 +301,9 @@ protected:
 
 /// Is a GPU backend compiled in at all?
 ///
-/// False on a build without EGL. A compositor checks this rather than
-/// calling open() and interpreting the error, so "no EGL in this build" and
-/// "no GPU in this machine" stay distinguishable.
+/// False in a build without Vulkan. A compositor checks this rather than
+/// calling open() and interpreting the error, so "no Vulkan in this build"
+/// and "no GPU in this machine" stay distinguishable.
 [[nodiscard]] bool gpu_available() noexcept;
 
 }  // namespace dye
