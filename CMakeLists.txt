@@ -156,6 +156,14 @@ add_executable(dye_bench tests/bench_readback.cpp)
 target_link_libraries(dye_bench PRIVATE dye)
 target_compile_options(dye_bench PRIVATE -Wall -Wextra -O2)
 
+# The other direction, and the one that is actually hot: a shared-memory
+# client (foot, every GTK app) is uploaded once per commit, on the
+# compositor's loop thread. Same reason as above — the pixels are correct
+# whether it takes 0.5 ms or 15, so only a clock can tell.
+add_executable(dye_bench_upload tests/bench_upload.cpp)
+target_link_libraries(dye_bench_upload PRIVATE dye)
+target_compile_options(dye_bench_upload PRIVATE -Wall -Wextra -O2)
+
 # The confusions that must not compile. A library selling type safety has to
 # prove the errors actually happen.
 add_test(NAME compile_fail

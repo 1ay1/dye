@@ -346,6 +346,8 @@ public:
     ~VulkanDevice() override {
         if (device_ == VK_NULL_HANDLE) return;
         vkDeviceWaitIdle(device_);
+        // The scratch command buffer goes with the pool; the fence doesn't.
+        if (scratch_fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, scratch_fence_, nullptr);
         if (command_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, command_pool_, nullptr);
         vkDestroyDevice(device_, nullptr);
     }
@@ -379,9 +381,13 @@ public:
 
     /// Run one command buffer and wait for it.
     ///
-    /// Only for read-back and layout transitions, both of which are already
-    /// off the hot path. The renderer submits its own work without waiting.
-    Status run_now(const std::function<void(VkCommandBuffer)>& record);
+    /// `on_transfer` sends the work to the transfer-only queue when the GPU
+    /// has one. An upload has nothing to do with the frame being drawn, and
+    /// on the graphics queue it queues BEHIND it: the wait below then covers
+    /// someone else's rendering as well as our copy. queues_of() already
+    /// found the idle family for exactly this reason.
+    Status run_now(const std::function<void(VkCommandBuffer)>& record,
+                   bool on_transfer = false);
 
     /// A memory type satisfying `bits` with these properties, or nothing.
     std::optional<std::uint32_t> memory_type(std::uint32_t bits,
@@ -404,6 +410,14 @@ private:
     VkQueue          transfer_queue_ = VK_NULL_HANDLE;
     Queues           families_{};
     VkCommandPool    command_pool_ = VK_NULL_HANDLE;
+    /// Reused by run_now, rather than created and destroyed per call.
+    ///
+    /// An upload happens once per commit per shared-memory surface, so
+    /// "allocate a command buffer, create a fence, free both" is a
+    /// per-frame cost paid for nothing. They are reset instead; run_now
+    /// waits before returning, so there is never a second user.
+    VkCommandBuffer  scratch_cmd_ = VK_NULL_HANDLE;
+    VkFence          scratch_fence_ = VK_NULL_HANDLE;
     DeviceInfo       info_{};
     std::vector<Layout> formats_;
     VkPhysicalDeviceMemoryProperties memory_{};
@@ -468,56 +482,76 @@ std::optional<std::uint32_t> VulkanDevice::memory_type(std::uint32_t bits,
     return std::nullopt;
 }
 
-Status VulkanDevice::run_now(const std::function<void(VkCommandBuffer)>& record) {
-    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = command_pool_;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
+Status VulkanDevice::run_now(const std::function<void(VkCommandBuffer)>& record,
+                            bool on_transfer) {
+    // The command buffer and fence are made ONCE and reset per call. They
+    // used to be allocated and destroyed every time, which for an upload —
+    // once per commit per shared-memory surface — is a per-frame cost buying
+    // nothing. Reuse is safe because this function waits before returning,
+    // so there is never a second user of either.
+    if (scratch_cmd_ == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = command_pool_;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        const VkResult ar = vkAllocateCommandBuffers(device_, &ai, &scratch_cmd_);
+        if (ar != VK_SUCCESS) {
+            scratch_cmd_ = VK_NULL_HANDLE;
+            return fail_vk(ar, "vkAllocateCommandBuffers() failed");
+        }
+    }
+    if (scratch_fence_ == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        const VkResult fr = vkCreateFence(device_, &fi, nullptr, &scratch_fence_);
+        if (fr != VK_SUCCESS) {
+            scratch_fence_ = VK_NULL_HANDLE;
+            return fail_vk(fr, "vkCreateFence() failed");
+        }
+    }
 
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkResult r = vkAllocateCommandBuffers(device_, &ai, &cmd);
-    if (r != VK_SUCCESS) return fail_vk(r, "vkAllocateCommandBuffers() failed");
+    const VkCommandBuffer cmd = scratch_cmd_;
+    const VkFence fence = scratch_fence_;
+
+    VkResult r = vkResetCommandBuffer(cmd, 0);
+    if (r != VK_SUCCESS) return fail_vk(r, "vkResetCommandBuffer() failed");
+    r = vkResetFences(device_, 1, &fence);
+    if (r != VK_SUCCESS) return fail_vk(r, "vkResetFences() failed");
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     r = vkBeginCommandBuffer(cmd, &bi);
-    if (r != VK_SUCCESS) {
-        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
-        return fail_vk(r, "vkBeginCommandBuffer() failed");
-    }
+    if (r != VK_SUCCESS) return fail_vk(r, "vkBeginCommandBuffer() failed");
 
     record(cmd);
 
     r = vkEndCommandBuffer(cmd);
-    if (r != VK_SUCCESS) {
-        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
-        return fail_vk(r, "vkEndCommandBuffer() failed");
-    }
+    if (r != VK_SUCCESS) return fail_vk(r, "vkEndCommandBuffer() failed");
 
-    // A fence rather than vkQueueWaitIdle: waiting on the whole queue stalls
-    // work that has nothing to do with this, which on a compositor is the
-    // frame currently being drawn.
-    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence = VK_NULL_HANDLE;
-    r = vkCreateFence(device_, &fi, nullptr, &fence);
-    if (r != VK_SUCCESS) {
-        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
-        return fail_vk(r, "vkCreateFence() failed");
-    }
+    // An upload goes to the transfer-only queue when the GPU has one, and
+    // only when the pool's family can feed it. On the graphics queue the copy
+    // waits behind whatever frame is being drawn, so the wait below would
+    // cover someone else's rendering too.
+    //
+    // The command pool was created for the graphics family, so a SEPARATE
+    // transfer family cannot take its buffers — that would be undefined
+    // behaviour, not a slow path. Until the pool is per-family, the transfer
+    // queue is used only when it IS the graphics family, which is where
+    // on_transfer costs nothing and changes nothing.
+    const bool same_family = families_.transfer == families_.graphics;
+    VkQueue queue = (on_transfer && same_family && transfer_queue_ != VK_NULL_HANDLE)
+                        ? transfer_queue_
+                        : graphics_queue_;
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    r = vkQueueSubmit(graphics_queue_, 1, &si, fence);
+    r = vkQueueSubmit(queue, 1, &si, fence);
     if (r == VK_SUCCESS) {
         // Two seconds. Not forever: a wedged GPU must not hang a compositor
         // with no way out, and a read-back that takes two seconds has
         // already failed at its job.
         r = vkWaitForFences(device_, 1, &fence, VK_TRUE, 2'000'000'000ULL);
     }
-
-    vkDestroyFence(device_, fence, nullptr);
-    vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
 
     if (r == VK_TIMEOUT) return fail(std::errc::timed_out, "the GPU did not finish in time");
     if (r != VK_SUCCESS) return fail_vk(r, "submitting to the GPU failed");
@@ -876,21 +910,38 @@ Status VulkanImage::write(const std::uint32_t* src, std::int32_t src_stride_px) 
     // Premultiplied ARGB32 into the image's own channel order. The same
     // mapping read() undoes, written once in each direction rather than a
     // format switch in the copy loop.
+    //
+    // For argb/xrgb there is nothing to do. A premultiplied ARGB32 word is
+    // B,G,R,A in memory on little-endian, which is byte for byte what the
+    // scalar path below writes — so it is a memcpy, and doing it a pixel at
+    // a time costs several milliseconds a frame for no change in output.
+    // That matters because this is the path EVERY shared-memory client takes
+    // (foot, every GTK app), once per commit, on the compositor's loop
+    // thread: a fullscreen terminal redrawing at 60 Hz pays it 60 times a
+    // second. Only abgr/xbgr actually need the channels moved.
     const bool swap_rb = !is_rgb(format_.order());
     auto* out = static_cast<std::uint8_t*>(staging_mapped_);
-    for (std::uint32_t y = 0; y < h; ++y) {
-        const std::uint32_t* in = src + static_cast<std::size_t>(y) * src_stride_px;
-        std::uint8_t* row = out + static_cast<std::size_t>(y) * w * 4;
-        for (std::uint32_t x = 0; x < w; ++x, row += 4) {
-            const std::uint32_t p = in[x];
-            const std::uint8_t b = static_cast<std::uint8_t>(p);
-            const std::uint8_t g = static_cast<std::uint8_t>(p >> 8);
-            const std::uint8_t r = static_cast<std::uint8_t>(p >> 16);
-            const std::uint8_t a = static_cast<std::uint8_t>(p >> 24);
-            row[0] = swap_rb ? r : b;
-            row[1] = g;
-            row[2] = swap_rb ? b : r;
-            row[3] = a;
+    if (!swap_rb) {
+        const auto row_bytes = static_cast<std::size_t>(w) * 4;
+        if (static_cast<std::uint32_t>(src_stride_px) == w) {
+            // Tightly packed: one copy for the whole surface.
+            std::memcpy(out, src, row_bytes * h);
+        } else {
+            for (std::uint32_t y = 0; y < h; ++y)
+                std::memcpy(out + static_cast<std::size_t>(y) * row_bytes,
+                            src + static_cast<std::size_t>(y) * src_stride_px, row_bytes);
+        }
+    } else {
+        for (std::uint32_t y = 0; y < h; ++y) {
+            const std::uint32_t* in = src + static_cast<std::size_t>(y) * src_stride_px;
+            std::uint8_t* row = out + static_cast<std::size_t>(y) * w * 4;
+            for (std::uint32_t x = 0; x < w; ++x, row += 4) {
+                const std::uint32_t p = in[x];
+                row[0] = static_cast<std::uint8_t>(p >> 16);   // r
+                row[1] = static_cast<std::uint8_t>(p >> 8);    // g
+                row[2] = static_cast<std::uint8_t>(p);         // b
+                row[3] = static_cast<std::uint8_t>(p >> 24);   // a
+            }
         }
     }
 
@@ -1057,7 +1108,11 @@ Result<std::unique_ptr<Device>> VulkanDevice::create(Candidate c) {
         return fail(std::errc::not_supported, "the driver cannot export memory as an fd");
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    // RESET_COMMAND_BUFFER because run_now reuses one buffer and resets it per
+    // call rather than allocating a fresh one; without this flag that reset is
+    // invalid usage.
+    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
+                VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = d->families_.graphics;
     r = vkCreateCommandPool(d->device_, &pci, nullptr, &d->command_pool_);
     if (r != VK_SUCCESS) return fail_vk(r, "vkCreateCommandPool() failed");
