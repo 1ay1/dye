@@ -55,13 +55,28 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DYE_GPU IMPORTED_TARGET egl gbm glesv2)
 
-add_library(dye INTERFACE)
+# The device layer is compiled: one source with the EGL headers, or a stub
+# that reports "no GPU backend" as an ordinary error. Which one is a build
+# decision, so no call site needs an #ifdef.
+if(DYE_GPU_FOUND)
+  set(DYE_DEVICE_SOURCE src/device.cpp)
+  message(STATUS "dye: GPU backend enabled (EGL + GBM + GLES2)")
+else()
+  set(DYE_DEVICE_SOURCE src/device_none.cpp)
+  message(STATUS "dye: no EGL/GBM/GLES2 — building without a GPU backend")
+endif()
+
+add_library(dye STATIC ${DYE_DEVICE_SOURCE})
 add_library(dye::dye ALIAS dye)
-target_include_directories(dye INTERFACE
+target_include_directories(dye PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_compile_features(dye INTERFACE cxx_std_23)
-target_link_libraries(dye INTERFACE jaal::jaal weft::weft)
+target_compile_features(dye PUBLIC cxx_std_23)
+target_link_libraries(dye PUBLIC jaal::jaal weft::weft)
+if(DYE_GPU_FOUND)
+  target_link_libraries(dye PRIVATE PkgConfig::DYE_GPU)
+endif()
+target_compile_options(dye PRIVATE -Wall -Wextra)
 set_target_properties(dye PROPERTIES EXPORT_NAME dye)
 
 if(DYE_SANITIZE STREQUAL "asan")
@@ -95,7 +110,7 @@ endif()
 enable_testing()
 
 add_executable(dye_tests tests/test_format.cpp tests/test_buffer.cpp
-                         tests/test_cpu.cpp tests/main.cpp)
+                         tests/test_cpu.cpp tests/test_device.cpp tests/main.cpp)
 target_link_libraries(dye_tests PRIVATE dye)
 target_compile_options(dye_tests PRIVATE -Wall -Wextra)
 add_test(NAME format COMMAND dye_tests)
