@@ -94,7 +94,8 @@ endif()
 
 enable_testing()
 
-add_executable(dye_tests tests/test_format.cpp tests/test_buffer.cpp tests/main.cpp)
+add_executable(dye_tests tests/test_format.cpp tests/test_buffer.cpp
+                         tests/test_cpu.cpp tests/main.cpp)
 target_link_libraries(dye_tests PRIVATE dye)
 target_compile_options(dye_tests PRIVATE -Wall -Wextra)
 add_test(NAME format COMMAND dye_tests)
